@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+USERNAME=volgactf
+IMAGE=volgactf-final-python-checker
+docker build -t $USERNAME/$IMAGE:latest .

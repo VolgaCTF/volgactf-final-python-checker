@@ -1,0 +1,7 @@
+# default
+aiohttp==3.4.4
+PyJWT==1.6.4
+cryptography==2.3.1
+python-dateutil==2.7.3
+themis.finals.checker.result==1.1.0
+watchgod==0.2
