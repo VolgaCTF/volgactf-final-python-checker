@@ -9,7 +9,7 @@ import logging
 import sys
 import dateutil.parser
 from dateutil.tz import tzlocal
-from themis.finals.checker.result import Result
+from volgactf.final.checker.result import Result
 from datetime import datetime
 import jwt
 
@@ -37,7 +37,7 @@ def import_path(filename):
 
 def load_checker():
     checker_module_name = os.getenv(
-        'THEMIS_FINALS_CHECKER_MODULE',
+        'VOLGACTF_FINAL_CHECKER_MODULE',
         os.path.join(os.getcwd(), 'checker.py')
     )
     checker_module = import_path(checker_module_name)
@@ -49,10 +49,10 @@ def load_checker():
 class CapsuleDecoder:
     def __init__(self):
         self.key = os.getenv(
-            'THEMIS_FINALS_FLAG_SIGN_KEY_PUBLIC'
+            'VOLGACTF_FINAL_FLAG_SIGN_KEY_PUBLIC'
         ).replace('\\n', "\n")
-        self.wrap_prefix_len = len(os.getenv('THEMIS_FINALS_FLAG_WRAP_PREFIX'))
-        self.wrap_suffix_len = len(os.getenv('THEMIS_FINALS_FLAG_WRAP_SUFFIX'))
+        self.wrap_prefix_len = len(os.getenv('VOLGACTF_FINAL_FLAG_WRAP_PREFIX'))
+        self.wrap_suffix_len = len(os.getenv('VOLGACTF_FINAL_FLAG_WRAP_SUFFIX'))
 
     def get_flag(self, capsule):
         payload = jwt.decode(
@@ -94,8 +94,8 @@ async def basic_auth(request, handler):
     if auth_header:
         auth = BasicAuth.decode(auth_header)
         authorized = \
-            auth.login == os.getenv('THEMIS_FINALS_AUTH_CHECKER_USERNAME') and\
-            auth.password == os.getenv('THEMIS_FINALS_AUTH_CHECKER_PASSWORD')
+            auth.login == os.getenv('VOLGACTF_FINAL_AUTH_CHECKER_USERNAME') and\
+            auth.password == os.getenv('VOLGACTF_FINAL_AUTH_CHECKER_PASSWORD')
 
     if not authorized:
         headers = {
@@ -116,8 +116,8 @@ class CheckerServer:
         self.capsule_decoder = CapsuleDecoder()
         self.checker_push, self.checker_pull = load_checker()
         self.master_auth = BasicAuth(
-            login=os.getenv('THEMIS_FINALS_AUTH_MASTER_USERNAME'),
-            password=os.getenv('THEMIS_FINALS_AUTH_MASTER_PASSWORD')
+            login=os.getenv('VOLGACTF_FINAL_AUTH_MASTER_USERNAME'),
+            password=os.getenv('VOLGACTF_FINAL_AUTH_MASTER_PASSWORD')
         )
 
     async def internal_push(self, endpoint, capsule, label, metadata):
