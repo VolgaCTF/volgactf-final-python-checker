@@ -1,17 +1,17 @@
-import asyncio
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
-from aiohttp import web, ClientSession, BasicAuth
-import os
-import time
 import json
 import logging
+import os
 import sys
+from datetime import datetime
+
+from aiohttp import web, BasicAuth, ClientSession
+from aiojobs.aiohttp import setup, spawn
 import dateutil.parser
 from dateutil.tz import tzlocal
-from volgactf.final.checker.result import Result
-from datetime import datetime
 import jwt
+
+from volgactf.final.checker.result import Result
+
 
 logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
@@ -19,6 +19,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+routes = web.RouteTableDef()
 
 def import_path(filename):
     module = None
@@ -38,12 +39,10 @@ def import_path(filename):
 def load_checker():
     checker_module_name = os.getenv(
         'VOLGACTF_FINAL_CHECKER_MODULE',
-        os.path.join(os.getcwd(), 'checker.py')
+        os.path.join(os.getcwd(), 'checker', 'main.py')
     )
     checker_module = import_path(checker_module_name)
-    checker_push = getattr(checker_module, 'push')
-    checker_pull = getattr(checker_module, 'pull')
-    return checker_push, checker_pull
+    return checker_module
 
 
 class CapsuleDecoder:
@@ -87,6 +86,14 @@ class Metadata:
         return self._service_name
 
 
+checker = load_checker()
+capsule_decoder = CapsuleDecoder()
+master_auth = BasicAuth(
+    login=os.getenv('VOLGACTF_FINAL_AUTH_MASTER_USERNAME'),
+    password=os.getenv('VOLGACTF_FINAL_AUTH_MASTER_PASSWORD')
+)
+
+
 @web.middleware
 async def basic_auth(request, handler):
     auth_header = request.headers.get('Authorization')
@@ -106,235 +113,181 @@ async def basic_auth(request, handler):
     return await handler(request)
 
 
-class CheckerServer:
-    def __init__(self, host, port):
-        self.host = host
-        self.port = port
-        self.pool = ThreadPoolExecutor(max_workers=4)
-        self.loop = asyncio.get_event_loop()
-        self.task_data = deque([])
-        self.capsule_decoder = CapsuleDecoder()
-        self.checker_push, self.checker_pull = load_checker()
-        self.master_auth = BasicAuth(
-            login=os.getenv('VOLGACTF_FINAL_AUTH_MASTER_USERNAME'),
-            password=os.getenv('VOLGACTF_FINAL_AUTH_MASTER_PASSWORD')
-        )
+async def safe_json_payload(request):
+    payload = None
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        logger.error('Invalid payload', exc_info=sys.exc_info())
+    finally:
+        return payload
 
-    async def internal_push(self, endpoint, capsule, label, metadata):
-        result = Result.INTERNAL_ERROR
-        updated_label = label
-        message = None
-        try:
-            raw_result = await self.checker_push(endpoint, capsule, label,
-                                                 metadata)
-            if isinstance(raw_result, tuple):
-                if len(raw_result) > 0:
-                    result = raw_result[0]
-                if len(raw_result) > 1:
-                    updated_label = raw_result[1]
-                if len(raw_result) > 2:
-                    message = raw_result[2]
-            else:
-                result = raw_result
-        except Exception:
-            logger.error('An exception occured', exc_info=sys.exc_info())
-        return result, updated_label, message
 
-    async def internal_pull(self, endpoint, capsule, label, metadata):
-        result = Result.INTERNAL_ERROR
-        message = None
-        try:
-            raw_result = await self.checker_pull(endpoint, capsule, label,
-                                                 metadata)
-            if isinstance(raw_result, tuple):
-                if len(raw_result) > 0:
-                    result = raw_result[0]
-                if len(raw_result) > 1:
-                    message = raw_result[1]
-            else:
-                result = raw_result
-        except Exception:
-            logger.exception('An exception occurred', exc_info=sys.exc_info())
-        return result, message
+async def safe_push(endpoint, capsule, label, metadata):
+    result = Result.INTERNAL_ERROR
+    updated_label = label
+    message = None
+    try:
+        raw_result = await checker.push(endpoint, capsule, label, metadata)
+        if isinstance(raw_result, tuple):
+            if len(raw_result) > 0:
+                result = raw_result[0]
+            if len(raw_result) > 1:
+                updated_label = raw_result[1]
+            if len(raw_result) > 2:
+                message = raw_result[2]
+        else:
+            result = raw_result
+    except Exception:
+        logger.error('An exception occured', exc_info=sys.exc_info())
+    return result, updated_label, message
 
-    async def background_push(self, payload):
-        params = payload['params']
-        metadata = Metadata(payload['metadata'])
-        t_created = dateutil.parser.parse(metadata.timestamp)
-        t_delivered = datetime.now(tzlocal())
 
-        flag = self.capsule_decoder.get_flag(params['capsule'])
+async def handle_push(payload):
+    params = payload['params']
+    metadata = Metadata(payload['metadata'])
+    t_created = dateutil.parser.parse(metadata.timestamp)
+    t_delivered = datetime.now(tzlocal())
 
-        status, updated_label, message = await self.internal_push(
-            params['endpoint'],
-            params['capsule'],
-            params['label'],
-            metadata
-        )
+    flag = capsule_decoder.get_flag(params['capsule'])
 
-        t_processed = datetime.now(tzlocal())
+    status, updated_label, message = await safe_push(
+        params['endpoint'],
+        params['capsule'],
+        params['label'],
+        metadata
+    )
 
-        job_result = dict(
-            status=status.value,
-            flag=flag,
-            label=updated_label,
-            message=message
-        )
+    t_processed = datetime.now(tzlocal())
 
-        delivery_time = (t_delivered - t_created).total_seconds()
-        processing_time = (
-            t_processed - t_delivered
-        ).total_seconds()
+    job_result = dict(
+        status=status.value,
+        flag=flag,
+        label=updated_label,
+        message=message
+    )
 
-        log_message = ('PUSH flag `{0}` /{1:d} to `{2}`@`{3}` ({4}) - '
-                       'status {5}, label `{6}` [delivery {7:.2f}s, '
-                       'processing {8:.2f}s]').format(
-            flag,
-            metadata.round,
-            metadata.service_name,
-            metadata.team_name,
-            params['endpoint'],
-            status.name,
-            job_result['label'],
-            delivery_time,
-            processing_time
-        )
+    delivery_time = (t_delivered - t_created).total_seconds()
+    processing_time = (
+        t_processed - t_delivered
+    ).total_seconds()
 
-        logger.info(log_message)
+    log_message = ('PUSH flag `{0}` /{1:d} to `{2}`@`{3}` ({4}) - '
+                   'status {5}, label `{6}` [delivery {7:.2f}s, '
+                   'processing {8:.2f}s]').format(
+        flag,
+        metadata.round,
+        metadata.service_name,
+        metadata.team_name,
+        params['endpoint'],
+        status.name,
+        job_result['label'],
+        delivery_time,
+        processing_time
+    )
 
-        async with ClientSession(auth=self.master_auth) as session:
-            uri = payload['report_url']
-            async with session.post(uri, json=job_result) as r:
-                if r.status != 204:
-                    logger.error(r.status)
-                    logger.error(await r.text())
+    logger.info(log_message)
 
-    async def background_pull(self, payload):
-        params = payload['params']
-        metadata = Metadata(payload['metadata'])
-        t_created = dateutil.parser.parse(metadata.timestamp)
-        t_delivered = datetime.now(tzlocal())
+    async with ClientSession(auth=master_auth) as session:
+        uri = payload['report_url']
+        async with session.post(uri, json=job_result) as r:
+            if r.status != 204:
+                logger.error(r.status)
+                logger.error(await r.text())
 
-        flag = self.capsule_decoder.get_flag(params['capsule'])
 
-        status, message = await self.internal_pull(
-            params['endpoint'],
-            params['capsule'],
-            params['label'],
-            metadata
-        )
+@routes.post('/push')
+async def push(request):
+    payload = await safe_json_payload(request)
+    if payload is None:
+        return web.Response(status=400)
+    await spawn(request, handle_push(payload))
+    return web.Response(status=202)
 
-        t_processed = datetime.now(tzlocal())
 
-        job_result = dict(
-            request_id=params['request_id'],
-            status=status.value,
-            message=message
-        )
+async def safe_pull(endpoint, capsule, label, metadata):
+    result = Result.INTERNAL_ERROR
+    message = None
+    try:
+        raw_result = await checker.pull(endpoint, capsule, label, metadata)
+        if isinstance(raw_result, tuple):
+            if len(raw_result) > 0:
+                result = raw_result[0]
+            if len(raw_result) > 1:
+                message = raw_result[1]
+        else:
+            result = raw_result
+    except Exception:
+        logger.exception('An exception occurred', exc_info=sys.exc_info())
+    return result, message
 
-        delivery_time = (t_delivered - t_created).total_seconds()
-        processing_time = (
-            t_processed - t_delivered
-        ).total_seconds()
 
-        log_message = ('PULL flag `{0}` /{1:d} from `{2}`@`{3}` ({4}) with '
-                       'label `{5}` - status {6} [delivery {7:.2f}s, '
-                       'processing {8:.2f}s]').format(
-            flag,
-            metadata.round,
-            metadata.service_name,
-            metadata.team_name,
-            params['endpoint'],
-            params['label'],
-            status.name,
-            delivery_time,
-            processing_time
-        )
+async def handle_pull(payload):
+    params = payload['params']
+    metadata = Metadata(payload['metadata'])
+    t_created = dateutil.parser.parse(metadata.timestamp)
+    t_delivered = datetime.now(tzlocal())
 
-        logger.info(log_message)
+    flag = capsule_decoder.get_flag(params['capsule'])
 
-        async with ClientSession(auth=self.master_auth) as session:
-            uri = payload['report_url']
-            async with session.post(uri, json=job_result) as r:
-                if r.status != 204:
-                    logger.error(r.status)
-                    logger.error(await r.text())
+    status, message = await safe_pull(
+        params['endpoint'],
+        params['capsule'],
+        params['label'],
+        metadata
+    )
 
-    async def process_queue(self):
-        while True:
-            if self.task_data:
-                entry = self.task_data.popleft()
-                task_type = entry['type']
-                payload = entry['payload']
-                try:
-                    if task_type == 'push':
-                        await self.background_push(payload)
-                    elif task_type == 'pull':
-                        await self.background_pull(payload)
-                except Exception:
-                    logger.error('Caught an exception',
-                                 exc_info=sys.exc_info())
-            else:
-                await asyncio.sleep(0.1)
+    t_processed = datetime.now(tzlocal())
 
-    async def start_background_tasks(self, app):
-        app['dispatch'] = app.loop.create_task(self.process_queue())
+    job_result = dict(
+        request_id=params['request_id'],
+        status=status.value,
+        message=message
+    )
 
-    async def cleanup_background_tasks(self, app):
-        app['dispatch'].cancel()
-        await app['dispatch']
+    delivery_time = (t_delivered - t_created).total_seconds()
+    processing_time = (
+        t_processed - t_delivered
+    ).total_seconds()
 
-    async def safe_json_payload(self, request):
-        payload = None
-        try:
-            payload = await request.json()
-        except json.JSONDecodeError:
-            logger.error('Invalid payload', exc_info=sys.exc_info())
-        finally:
-            return payload
+    log_message = ('PULL flag `{0}` /{1:d} from `{2}`@`{3}` ({4}) with '
+                   'label `{5}` - status {6} [delivery {7:.2f}s, '
+                   'processing {8:.2f}s]').format(
+        flag,
+        metadata.round,
+        metadata.service_name,
+        metadata.team_name,
+        params['endpoint'],
+        params['label'],
+        status.name,
+        delivery_time,
+        processing_time
+    )
 
-    def enqueue_task(self, task_type, payload):
-        self.task_data.append(dict(
-            type=task_type,
-            payload=payload
-        ))
+    logger.info(log_message)
 
-    async def handle_push(self, request):
-        payload = await self.safe_json_payload(request)
-        if payload is None:
-            return web.Response(status=400)
-        self.enqueue_task('push', payload)
-        return web.Response(status=202)
+    async with ClientSession(auth=master_auth) as session:
+        uri = payload['report_url']
+        async with session.post(uri, json=job_result) as r:
+            if r.status != 204:
+                logger.error(r.status)
+                logger.error(await r.text())
 
-    async def handle_pull(self, request):
-        payload = await self.safe_json_payload(request)
-        if payload is None:
-            return web.Response(status=400)
-        self.enqueue_task('pull', payload)
-        return web.Response(status=202)
 
-    def get_routes(self):
-        return [
-            web.post('/push', self.handle_push),
-            web.post('/pull', self.handle_pull)
-        ]
-
-    async def create_app(self):
-        app = web.Application(middlewares=[basic_auth])
-        app.add_routes(self.get_routes())
-        return app
-
-    def run_app(self):
-        loop = self.loop
-        app = loop.run_until_complete(self.create_app())
-        app.on_startup.append(self.start_background_tasks)
-        app.on_cleanup.append(self.cleanup_background_tasks)
-        web.run_app(app, host=self.host, port=self.port)
+@routes.post('/pull')
+async def pull(request):
+    payload = await safe_json_payload(request)
+    if payload is None:
+        return web.Response(status=400)
+    await spawn(request, handle_pull(payload))
+    return web.Response(status=202)
 
 
 def main():
-    checker = CheckerServer(host='0.0.0.0', port=80)
-    checker.run_app()
+    app = web.Application(middlewares=[basic_auth])
+    app.add_routes(routes)
+    setup(app)
+    web.run_app(app, host='0.0.0.0', port=80)
 
 
 if __name__ == '__main__':

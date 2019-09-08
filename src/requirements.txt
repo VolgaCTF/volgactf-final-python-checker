@@ -1,0 +1,7 @@
+aiohttp
+aiojobs
+PyJWT
+cryptography
+python-dateutil
+watchgod
+volgactf.final.checker.result==1.0.0

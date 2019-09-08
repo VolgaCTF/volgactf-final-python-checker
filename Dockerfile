@@ -1,4 +1,4 @@
-FROM python:3.6-alpine
-ADD src BASE-VERSION /dist/
+FROM python:3.7-alpine
+ADD src VERSION /dist/
 WORKDIR /dist
-RUN apk add --update build-base libffi-dev openssl-dev && pip install -r base-requirements.txt
+RUN apk add --update build-base libffi-dev openssl-dev && pip install -r requirements.txt

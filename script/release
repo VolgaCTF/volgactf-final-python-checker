@@ -2,7 +2,7 @@
 USERNAME=volgactf
 IMAGE=volgactf-final-python-checker
 
-version=`cat BASE-VERSION`
+version=`cat VERSION`
 echo "version: $version"
 
 docker tag $USERNAME/$IMAGE:latest $USERNAME/$IMAGE:$version
