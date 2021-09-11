@@ -1,4 +1,4 @@
-FROM python:3.7-alpine
+FROM python:3.7-slim
 ADD src VERSION /dist/
 WORKDIR /dist
-RUN apk add --update build-base libffi-dev openssl-dev && pip install -r requirements.txt
+RUN apt-get update && apt-get install -y build-essential libffi-dev libssl-dev && pip install --upgrade pip && pip install --requirement requirements.txt

@@ -283,6 +283,11 @@ async def pull(request):
     return web.Response(status=202)
 
 
+@routes.get('/healthcheck')
+async def healthcheck(request):
+    return web.Response(status=204)
+
+
 def main():
     app = web.Application(middlewares=[basic_auth])
     app.add_routes(routes)
